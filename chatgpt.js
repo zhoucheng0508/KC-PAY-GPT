@@ -4,6 +4,7 @@ const axios = require('axios');
 const store = require('./mysql-store');
 const { getRegionConfig } = require('./region-config');
 const { executePaymentWithRetry } = require('./payment-retry');
+const { classifyCheckoutFailure } = require('./checkout-api-policy');
 
 function buildCheckoutPayload(planName, country, currency) {
     const uiMode = String(process.env.CHECKOUT_UI_MODE || 'custom').trim() || 'custom';
@@ -11,7 +12,10 @@ function buildCheckoutPayload(planName, country, currency) {
         entry_point: 'all_plans_pricing_modal',
         plan_name: planName,
         billing_details: { country, currency },
-        checkout_ui_mode: uiMode
+        price_interval: 'month',
+        checkout_ui_mode: uiMode,
+        supports_saved_payment_link: true,
+        checkout_source: 'chatgpt_web_classic'
     };
 }
 
@@ -62,7 +66,7 @@ function parseCheckoutApiResponse(status, bodyText) {
 /**
  * 使用 axios 直接调用 Checkout API（供后台调试 / 无 Playwright 场景）
  */
-async function createHostedCheckoutLink({ accessToken, planType = 'plus', planName, country, currency }) {
+async function createHostedCheckoutLink({ accessToken, planType = 'plus', planName, country, currency, proxy = '' }) {
     const token = String(accessToken || '').trim();
     if (!token) {
         return { success: false, error: '缺少 AccessToken' };
@@ -73,7 +77,21 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
     const planNameResolved = String(planName || store.resolvePlanName(planType)).trim();
     const payload = buildCheckoutPayload(planNameResolved, region, billingCurrency);
 
-    const response = await axios.post(
+    // Axios does not read the application's PROXY setting. Use one explicit
+    // transport for both HTTP and SOCKS proxies, without ambient proxy overrides.
+    let proxyAgent;
+    if (proxy) {
+        let proxyUrl;
+        try { proxyUrl = new URL(proxy); } catch (_) { throw new Error('Checkout 代理 URL 格式无效'); }
+        if (!['http:', 'https:', 'socks:', 'socks4:', 'socks5:', 'socks5h:'].includes(proxyUrl.protocol)) {
+            throw new Error('不支持的 Checkout 代理协议');
+        }
+        const { ProxyAgent } = require('proxy-agent');
+        proxyAgent = new ProxyAgent({ getProxyForUrl: () => proxy });
+    }
+    let response;
+    try {
+        response = await axios.post(
         'https://chatgpt.com/backend-api/payments/checkout',
         payload,
         {
@@ -82,12 +100,23 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
                 'Content-Type': 'application/json',
                 Accept: 'application/json'
             },
+            proxy: false,
+            httpAgent: proxyAgent,
+            httpsAgent: proxyAgent,
+            maxRedirects: 0,
             validateStatus: () => true,
             timeout: 30000
         }
-    );
+        );
+    } catch (_) {
+        // Axios errors carry config.headers.Authorization and proxy credentials.
+        return { success: false, code: 'CHECKOUT_TRANSPORT_FAILED', error: 'Checkout 网络请求失败，请检查代理和连接', http_status: null };
+    } finally {
+        proxyAgent?.destroy();
+    }
 
-    const parsed = parseCheckoutApiResponse(response.status, JSON.stringify(response.data ?? {}));
+    const parsed = parseCheckoutApiResponse(response.status,
+        typeof response.data === 'string' ? response.data : JSON.stringify(response.data ?? {}));
     const base = {
         plan_type: planType,
         plan_name: planNameResolved,
@@ -99,7 +128,7 @@ async function createHostedCheckoutLink({ accessToken, planType = 'plus', planNa
     };
 
     if (!parsed.ok) {
-        return { success: false, ...base, error: parsed.error };
+        return { success: false, ...base, code: classifyCheckoutFailure(parsed.status, parsed.error), error: parsed.error };
     }
 
     return {
@@ -125,8 +154,9 @@ class ChatGPTService {
      * @param {object} request - Playwright context.request 实例
      * @param {string} token - OpenAI Bearer Token
      */
-    constructor(request, token) {
+    constructor(request, token, page = null) {
         this.request = request;
+        this.page = page;
         this.token = token;
         this.headers = {
             "Authorization": `Bearer ${this.token}`,
@@ -180,13 +210,43 @@ class ChatGPTService {
             const payload = buildCheckoutPayload(planName, country, currency);
             console.log(`[ChatGPT] 创建 Checkout Session: plan_name=${planName}, country=${country}, currency=${currency}, checkout_ui_mode=${payload.checkout_ui_mode}`);
 
-            const response = await this.request.post("https://chatgpt.com/backend-api/payments/checkout", {
-                headers: this.headers,
-                data: payload
-            });
-
-            const bodyText = await response.text().catch(() => "");
-            const parsed = parseCheckoutApiResponse(response.status(), bodyText);
+            let status;
+            let bodyText;
+            if (this.page) {
+                // Keep browser checkout traffic on the same network path as login.
+                // APIRequestContext uses Node networking, which can resolve/reach a
+                // different address even when the native browser works correctly.
+                if (new URL(this.page.url()).origin !== 'https://chatgpt.com') {
+                    throw new Error('Checkout API 需要已登录的 chatgpt.com 页面');
+                }
+                const result = await this.page.evaluate(async ({ headers, payload }) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), 30000);
+                    try {
+                        const response = await fetch('/backend-api/payments/checkout', {
+                            method: 'POST',
+                            headers,
+                            credentials: 'include',
+                            body: JSON.stringify(payload),
+                            signal: controller.signal
+                        });
+                        return { status: response.status, body: await response.text() };
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }, { headers: this.headers, payload });
+                status = result.status;
+                bodyText = result.body;
+            } else {
+                const response = await this.request.post("https://chatgpt.com/backend-api/payments/checkout", {
+                    headers: this.headers,
+                    data: payload,
+                    timeout: 30000
+                });
+                status = response.status();
+                bodyText = await response.text().catch(() => "");
+            }
+            const parsed = parseCheckoutApiResponse(status, bodyText);
 
             if (!parsed.ok) {
                 const detail = parsed.error;
@@ -197,7 +257,8 @@ class ChatGPTService {
                 } else if (String(detail).includes('permission') || String(detail).includes('already_subscribed')) {
                     console.error("❌ [提示] 该账号可能已订阅或无权重复开通");
                 }
-                return { sessionId: null, checkoutUrl: null, error: detail };
+                return { sessionId: null, checkoutUrl: null, error: detail,
+                    httpStatus: parsed.status, code: classifyCheckoutFailure(parsed.status, detail) };
             }
 
             console.log(`✅ 订单创建成功 (session: ${parsed.sessionId ? parsed.sessionId.slice(0, 24) + '...' : 'unknown'})`);
@@ -206,8 +267,11 @@ class ChatGPTService {
             }
             return { sessionId: parsed.sessionId, checkoutUrl: parsed.checkoutUrl };
         } catch (e) {
-            console.error("[-] 创建 Checkout Session 异常:", e.message);
-            return { sessionId: null, checkoutUrl: null, error: e.message };
+            // Playwright appends request headers (including tokens and Cookies) to
+            // multiline transport errors. Keep only the diagnostic first line.
+            const error = String(e.message || 'Checkout 请求失败').split(/\r?\n/)[0];
+            console.error("[-] 创建 Checkout Session 异常:", error);
+            return { sessionId: null, checkoutUrl: null, error };
         }
     }
 
@@ -391,10 +455,13 @@ async function openApiCheckout(page, { accessToken, planType, country, currency,
     const billingCurrency = String(currency || getRegionConfig(region)?.currency || 'PHP').toUpperCase();
     console.log(`🧭 [步骤] 正在通过 API 创建 Checkout (country=${region}, currency=${billingCurrency}, plan=${planType})...`);
 
-    const gpt = new ChatGPTService(page.context().request, token);
+    const gpt = new ChatGPTService(page.context().request, token, page);
     const checkout = await gpt.createCheckoutSession(planType, region, billingCurrency, planNameOverride);
     if (!checkout.checkoutUrl) {
-        throw new Error(`API 创建 Checkout 失败: ${checkout.error || '未返回 data.url'}`);
+        const error = new Error(`API 创建 Checkout 失败 [${checkout.code || 'CHECKOUT_API_FAILED'}${checkout.httpStatus ? ` HTTP ${checkout.httpStatus}` : ''}]: ${checkout.error || '未返回 data.url'}`);
+        error.code = checkout.code || 'CHECKOUT_API_FAILED';
+        error.httpStatus = checkout.httpStatus;
+        throw error;
     }
 
     const url = checkout.checkoutUrl;
@@ -447,3 +514,4 @@ module.exports.openApiCheckout = openApiCheckout;
 module.exports.createHostedCheckoutLink = createHostedCheckoutLink;
 module.exports.buildCheckoutPayload = buildCheckoutPayload;
 module.exports.formatApiErrorDetail = formatApiErrorDetail;
+module.exports.assertCheckoutPageReady = assertCheckoutPageReady;

@@ -19,7 +19,7 @@ const { buildHcaptchaEnvFromConfig } = require('./hcaptcha-runtime');
 const { checkHcaptchaSolverHealth, testVlmConnectivity, listSolverLogFiles, readSolverLogTail } = require('./hcaptcha-solver');
 const { testCaptchaPlatformConnectivity, normalizeCaptchaPlatformApiUrl, resolveCaptchaPlatformCredentials } = require('./captcha-platform');
 const browserPool = require('./browser-pool');
-const { buildWorkerRuntimeEnv } = require('./browser-runtime');
+const { buildWorkerRuntimeEnv, getTaskBrowserProxy, resolveExternalProfileDir, withExternalBrowserLease } = require('./browser-runtime');
 const { querySubscriptionBySession, validateSessionTokenForQuery, cancelAutoRenew, resumeAutoRenew } = require('./subscription-check');
 const gptApi = require('./gpt-api-client');
 
@@ -1897,7 +1897,7 @@ app.get('/api/admin/data', async (req, res) => {
 app.get('/api/admin/browser-pool', async (req, res) => {
     try {
         await ensureStoreReady();
-        const modeEnabled = await store.getBrowserPoolEnabled();
+        const modeEnabled = browserPool.getRuntimeEnabled();
         const system = await getSystemMetrics();
         const memText = String(system?.memory?.text || '');
         const memMatch = memText.match(/([\d.]+)G\/([\d.]+)G/);
@@ -1930,6 +1930,9 @@ app.post('/api/admin/browser-pool/mode', async (req, res) => {
         const enabled = req.body?.enabled === true
             || req.body?.enabled === 1
             || String(req.body?.enabled || '').trim() === '1';
+        if (enabled && ['standalone', 'external'].includes(process.env.BROWSER_RUNTIME_MODE)) {
+            return res.status(400).json({ success: false, message: '当前启动配置已固定浏览器运行模式；请更改启动方式后再启用浏览器池' });
+        }
         await store.setBrowserPoolEnabled(enabled);
         const info = await syncBrowserPoolModeFromStore();
         res.json({
@@ -3089,7 +3092,8 @@ app.delete('/api/admin/billing/:id', async (req, res) => {
 
 
 async function syncBrowserPoolModeFromStore() {
-    const enabled = await store.getBrowserPoolEnabled();
+    const enabled = ['standalone', 'external', 'persistent'].includes(process.env.BROWSER_RUNTIME_MODE)
+        ? false : await store.getBrowserPoolEnabled();
     browserPool.setRuntimeEnabled(enabled);
     if (!enabled) {
         await browserPool.shutdownBrowserPool().catch(() => {});
@@ -3100,6 +3104,17 @@ async function syncBrowserPoolModeFromStore() {
 }
 
 async function spawnWorkerWithBrowser({ jobKey, runtimeEnv, runScript }) {
+    if (runtimeEnv.BROWSER_RUNTIME_MODE === 'persistent') {
+        logTask(jobKey, '浏览器模式: 服务器持久化 Chromium');
+        return runScript(buildWorkerRuntimeEnv(runtimeEnv, null, 'persistent'));
+    }
+    const externalProfile = resolveExternalProfileDir(runtimeEnv);
+    if (externalProfile) {
+        return withExternalBrowserLease(externalProfile, async () => {
+            logTask(jobKey, '浏览器模式: 接入 AdsPower 已打开的环境，使用环境自身的代理');
+            return runScript({ ...runtimeEnv, PROXY: '', HUMAN_VERIFICATION_MODE: 'manual' });
+        });
+    }
     const poolEnabled = browserPool.getRuntimeEnabled();
     if (!poolEnabled) {
         logTask(jobKey, '浏览器模式: 独立启动（后台已关闭浏览器池）');
@@ -3120,14 +3135,14 @@ function spawnCheckoutDebugWorker({ task, token, sessionRaw, planType, region, p
     (async () => {
         const checkoutScript = path.join(__dirname, 'index.js');
         try {
-            const proxy = await store.getActiveProxy();
+            const proxy = await getTaskBrowserProxy(store);
             const hcaptchaCfg = await store.getHcaptchaConfig();
             const { env: hcaptchaEnv } = buildHcaptchaEnvFromConfig(hcaptchaCfg);
             const runtimeEnv = {
                 ...process.env,
                 ...hcaptchaEnv,
                 CHECKOUT_DEBUG_ONLY: '1',
-                CHECKOUT_MODE: 'api',
+                CHECKOUT_MODE: process.env.CHECKOUT_MODE || process.env.CHECKOUT_DEBUG_MODE || 'api',
                 CHATGPT_TOKEN: token,
                 CHATGPT_SESSION_JSON: String(sessionRaw || '').startsWith('{') ? sessionRaw : '',
                 CDK_PLAN_TYPE: planType,
@@ -3138,7 +3153,9 @@ function spawnCheckoutDebugWorker({ task, token, sessionRaw, planType, region, p
                 PROXY: proxy
             };
 
-            logTask(task.jobKey, `启动 Playwright 浏览器 proxy=${proxy ? 'yes' : 'no'}`);
+            logTask(task.jobKey, resolveExternalProfileDir(runtimeEnv)
+                ? '连接 AdsPower 浏览器，代理沿用 AdsPower 环境配置'
+                : `启动 Playwright 浏览器 proxy=${proxy ? 'yes' : 'no'}`);
             const run = await spawnWorkerWithBrowser({
                 jobKey: task.jobKey,
                 runtimeEnv,
@@ -3457,13 +3474,16 @@ function spawnActivationWorker({ task, token, sessionRaw, cdk, cdkDetails, clien
                     cdkCode: cdk
                 });
 
-                const proxy = await store.getActiveProxy();
+                const proxy = await getTaskBrowserProxy(store);
                 const hcaptchaCfg = await store.getHcaptchaConfig();
                 const { env: hcaptchaEnv } = buildHcaptchaEnvFromConfig(hcaptchaCfg);
                 const runtimeEnv = {
                     ...process.env,
                     ...hcaptchaEnv,
                     JOB_KEY: task.jobKey,
+                    CHECKOUT_DEBUG_ONLY: '0',
+                    PAYMENT_PREFLIGHT_ONLY: '0',
+                    PAYMENT_REVIEW_ONLY: '0',
                     CHATGPT_TOKEN: token,
                     CHATGPT_SESSION_JSON: String(sessionRaw || '').startsWith('{') ? sessionRaw : '',
                     CDK_CODE: cdk,
@@ -3871,6 +3891,21 @@ app.post('/api/verify-cdk', async (req, res) => {
         return res.status(403).json({ success: false, message: cdkData?.used_at ? '该 CDK 已使用' : '无效 CDK' });
     } catch (error) {
         return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/api/task-status', async (req, res) => {
+    const jobKey = String(req.body?.jobKey || '').trim();
+    const cdk = String(req.body?.cdk || '').trim();
+    if (!jobKey || !cdk) return res.status(400).json({ success: false, message: '缺少任务或兑换码' });
+    try {
+        await ensureStoreReady();
+        const task = await store.getTaskStatus(jobKey);
+        if (!task || task.cdk_code !== cdk) return res.status(404).json({ success: false, message: '未找到任务' });
+        res.set('Cache-Control', 'no-store');
+        res.json({ success: true, data: { type: 'snapshot', jobKey, status: task.status, message: task.message, progress: Number(task.progress || 0) } });
+    } catch (error) {
+        res.status(500).json({ success: false, message: '查询任务状态失败' });
     }
 });
 

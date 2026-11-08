@@ -503,6 +503,30 @@
         let socketHeartbeatTimeout = null;
         let activeJobKey = '';
         let taskCompleted = false;
+        let taskPollTimer = null;
+        let pollingJobKey = '';
+        function startTaskPolling(jobKey) {
+            if (pollingJobKey === jobKey) return;
+            clearTimeout(taskPollTimer);
+            pollingJobKey = jobKey;
+            const poll = async () => {
+                try {
+                    const response = await fetch('/api/task-status', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ jobKey, cdk: verifiedCdk }),
+                        signal: AbortSignal.timeout(10000)
+                    });
+                    const result = await response.json();
+                    if (activeJobKey === jobKey && !taskCompleted && result.success) applyTaskState(result.data);
+                } catch (error) {
+                    console.error('Task status polling failed:', error);
+                } finally {
+                    if (activeJobKey === jobKey && !taskCompleted && pollingJobKey === jobKey) taskPollTimer = setTimeout(poll, 3000);
+                }
+            };
+            poll();
+        }
         const WS_HEARTBEAT_INTERVAL_MS = 15000;
         const WS_HEARTBEAT_TIMEOUT_MS = 45000;
 
@@ -539,6 +563,9 @@
         }
 
         function closeTaskSocket() {
+            clearTimeout(taskPollTimer);
+            taskPollTimer = null;
+            pollingJobKey = '';
             clearTimeout(reconnectTimer);
             reconnectTimer = null;
             clearSocketHeartbeat();
@@ -637,18 +664,20 @@
             }
 
             activeJobKey = jobKey;
+            startTaskPolling(jobKey);
 
-            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+            if (socket && socket.readyState === WebSocket.OPEN) {
                 socket.send(JSON.stringify({ type: 'subscribe', jobKey }));
                 return;
             }
+            if (socket && socket.readyState === WebSocket.CONNECTING) return;
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             socket = new WebSocket(`${protocol}//${window.location.host}`);
 
             socket.onopen = () => {
                 clearTimeout(reconnectTimer);
-                socket.send(JSON.stringify({ type: 'subscribe', jobKey }));
+                socket.send(JSON.stringify({ type: 'subscribe', jobKey: activeJobKey }));
                 startSocketHeartbeat();
             };
 

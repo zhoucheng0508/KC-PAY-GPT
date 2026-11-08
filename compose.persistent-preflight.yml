@@ -1,0 +1,31 @@
+name: kc-pay-persistent-preflight
+services:
+  preflight:
+    build:
+      context: .
+      dockerfile: Dockerfile.preflight
+    init: true
+    restart: "no"
+    shm_size: 512mb
+    mem_limit: 2g
+    cpus: 2
+    command: ["xvfb-run", "-a", "--server-args=-screen 0 1365x900x24 -nolisten tcp", "node", "scripts/check-persistent-browser.cjs"]
+    environment:
+      PERSISTENT_PROFILE_DIR: /profiles/server-check
+      PERSISTENT_CHECK_STAGE: ${PERSISTENT_CHECK_STAGE:-public}
+      PERSISTENT_CHECKOUT_MODE: ${PERSISTENT_CHECKOUT_MODE:-official_client}
+      PREFLIGHT_REPLACE_SESSION: ${PREFLIGHT_REPLACE_SESSION:-0}
+      PERSISTENT_VISIBLE_VERIFICATION: ${PERSISTENT_VISIBLE_VERIFICATION:-0}
+      PREFLIGHT_PROXY: ${PREFLIGHT_PROXY:-}
+      PREFLIGHT_PLAN: ${PREFLIGHT_PLAN:-plus}
+      PREFLIGHT_COUNTRY: ${PREFLIGHT_COUNTRY:-PH}
+    volumes:
+      - browser_profile:/profiles
+      - type: bind
+        source: ${PREFLIGHT_SESSION_FILE:-./session.json}
+        target: /run/secrets/session.json
+        read_only: true
+    extra_hosts:
+      - host.docker.internal:host-gateway
+volumes:
+  browser_profile:

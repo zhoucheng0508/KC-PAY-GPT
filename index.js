@@ -1,6 +1,7 @@
 const { executePaymentWithRetry } = require('./payment-retry');
 const { openPricingCheckout } = require('./pricing-checkout');
 const { openApiCheckout } = require('./chatgpt');
+const { shouldFallbackToCheckoutUi } = require('./checkout-api-policy');
 const store = require('./mysql-store');
 const { getRegionConfig, getRegionBrowserProfile } = require('./region-config');
 const { installChatGptSession, bootstrapChatGptSession } = require('./session-auth');
@@ -46,7 +47,7 @@ const CONFIG = {
     planType: process.env.CDK_PLAN_TYPE || "",
     planNameOverride: process.env.PLAN_NAME_OVERRIDE || "",
     paymentRegionOverride: process.env.PAYMENT_REGION_OVERRIDE || "",
-    proxy: process.env.PROXY || ""
+    proxy: process.env.BROWSER_PROXY_MODE === 'direct' ? '' : (process.env.PROXY || "")
 };
 
 // 录像开关（默认开启；设 RECORD_VIDEO=0 可关闭）与输出目录
@@ -119,9 +120,11 @@ async function captureDebugScreenshot(context, preferredPage, prefix, label = '�
         console.warn(`⚠️ [系统] ${label}未保存：当前没有可用页面。`);
         return null;
     }
+    if (new URL(targetPage.url()).pathname === '/api/auth/session') return null;
 
     const screenshotPath = buildDebugScreenshotPath(prefix);
-    await targetPage.screenshot({ path: screenshotPath, fullPage: true });
+    const mask = process.env.PAYMENT_REVIEW_ONLY === '1' ? targetPage.frames().map(frame => frame.locator('input')) : [];
+    await targetPage.screenshot({ path: screenshotPath, fullPage: true, mask });
     console.log(`📸 [系统] ${label}已保存: ${screenshotPath}`);
     return screenshotPath;
 }
@@ -187,7 +190,9 @@ async function run() {
     let context = null;
     let page = null;
     let paymentSucceeded = false;
+    let preserveExternalPage = false;
 
+    try {
     const preparedProxy = await preparePlaywrightProxy(CONFIG.proxy);
     proxyCleanup = preparedProxy.cleanup;
     const proxyConfig = preparedProxy.proxyConfig;
@@ -203,6 +208,7 @@ async function run() {
     });
     applyCdpEnv(browserSession);
     browser = browserSession.browser;
+    if (browserSession.mode === 'external') process.env.HUMAN_VERIFICATION_MODE = 'manual';
 
     const realUserAgent = browserSession.realUserAgent;
 
@@ -242,14 +248,11 @@ async function run() {
         };
     }
 
-    context = await browser.newContext(contextOptions);
+    context = browserSession.context || await browser.newContext(contextOptions);
     const sessionRaw = CONFIG.chatgptSessionJson || CONFIG.chatgptToken;
-    const installResult = await installChatGptSession(context, sessionRaw);
-    const sessionData = installResult?.sessionData || installResult;
-    const cookieVerified = Boolean(installResult?.cookieVerified);
 
     // ============= 指纹伪装 =============
-    await context.addInitScript((injectedChromeMajor) => {
+    if (!browserSession.context) await context.addInitScript((injectedChromeMajor) => {
         const NavProto = Object.getPrototypeOf(navigator);
         const ScrProto = Object.getPrototypeOf(screen);
         const safeDefine = (obj, key, getter) => {
@@ -457,7 +460,23 @@ async function run() {
         } catch (_) { }
     }, chromeMajor);
 
-    try {
+        const persistent = browserSession.mode === 'persistent';
+        if (persistent && process.env.CHECKOUT_MODE !== 'official_client') {
+            throw new Error('persistent 模式必须显式配置 CHECKOUT_MODE=official_client');
+        }
+        if (persistent) page = browserSession.page;
+        const installResult = persistent
+            ? await require('./server-session').prepareServerSession(context, page, sessionRaw)
+            : await installChatGptSession(context, sessionRaw, {
+            nativeSession: browserSession.mode === 'external',
+            onVerificationFailure: async (probe) => {
+                const screenshot = await captureDebugScreenshot(context, probe, 'session_verification', 'Session 校验失败截图');
+                if (screenshot) console.log(`FAILURE_SCREENSHOT: ${screenshot}`);
+            }
+        });
+        const sessionData = installResult?.sessionData || installResult;
+        const cookieVerified = Boolean(installResult?.cookieVerified);
+
         // --- Phase 0: Proxy Connectivity Check ---
         if (proxyConfig) {
             console.log('正在检查代理连通性...');
@@ -480,8 +499,12 @@ async function run() {
 
         // --- Phase 1: Resolve payment parameters ---
         const debugOnly = process.env.CHECKOUT_DEBUG_ONLY === '1';
+        const preflightOnly = process.env.PAYMENT_PREFLIGHT_ONLY === '1';
+        const checkoutMode = String(process.env.CHECKOUT_MODE || 'api').toLowerCase();
         if (debugOnly) {
-            console.log('[调试] 支付链接调试模式：浏览器注入 Session → Checkout API → 输出链接（不执行支付）');
+            const loginMode = browserSession.mode === 'external' ? 'AdsPower 真实登录' : '浏览器注入 Session';
+            const checkoutRoute = checkoutMode === 'official_client' ? '官网客户端新建 Checkout API' : checkoutMode === 'ui' ? '官网升级页面' : 'Checkout API';
+            console.log(`[调试] 支付链接调试模式：${loginMode} → ${checkoutRoute} → 输出链接（不执行支付）`);
         } else {
             console.log('[1] 准备自助充值流程...');
         }
@@ -511,23 +534,36 @@ async function run() {
 
         console.log(`[1] 套餐类型: ${planType}, 地区: ${paymentRegion}, 币种: ${billingCurrency}`);
 
-        page = await context.newPage();
+        if (!persistent) page = await context.newPage();
         page.on('close', () => {
-            console.warn(`⚠️ [系统] 当前页面已关闭，关闭前最后 URL: ${page.url()}`);
+            console.warn(persistent ? '[Server browser] 当前任务页已关闭' : `⚠️ [系统] 当前页面已关闭，关闭前最后 URL: ${page.url()}`);
         });
 
-        const loginInfo = await bootstrapChatGptSession(page, sessionRaw, { sessionData, cookieVerified });
+        const loginInfo = persistent ? { session: sessionData, email: sessionData?.user?.email }
+            : await bootstrapChatGptSession(page, sessionRaw, { sessionData, cookieVerified });
         if (loginInfo.email && !email) {
             console.log(`[Info] 账号邮箱: ${loginInfo.email}`);
         }
 
-        // --- Phase 2: API 创建 Checkout（注入账单地区），失败时回退 UI 定价页 ---
-        const checkoutMode = String(process.env.CHECKOUT_MODE || 'api').toLowerCase();
+        // API failures stop unless the operator explicitly enables the legacy UI fallback.
         let checkoutOpened = false;
         let checkoutResult = null;
         const planNameOverride = String(CONFIG.planNameOverride || '').trim() || undefined;
 
-        if (checkoutMode !== 'ui') {
+        if (checkoutMode === 'official_client') {
+            if (planNameOverride && planNameOverride !== require('./official-client-checkout').OFFICIAL_PLANS[planType]?.name) {
+                throw new Error('官网客户端建单验证不支持自定义套餐名称');
+            }
+            const { createOfficialClientCheckout } = require('./official-client-checkout');
+            checkoutResult = await createOfficialClientCheckout(page, {
+                planType, country: billingCountry, currency: billingCurrency,
+                onPricingPage: persistent ? (currentPage) => require('./server-session').verifyServerPage(currentPage) : undefined
+            });
+            if (!debugOnly || preflightOnly || process.env.CHECKOUT_DEBUG_VERIFY_PAGE === '1') {
+                checkoutResult.readiness = await require('./checkout-preflight').openVerifiedCheckout(page, checkoutResult, { currency: billingCurrency });
+            }
+            checkoutOpened = true;
+        } else if (checkoutMode !== 'ui') {
             try {
                 checkoutResult = await openApiCheckout(page, {
                     accessToken: loginInfo.session?.accessToken || CONFIG.chatgptToken,
@@ -543,7 +579,7 @@ async function run() {
                 if (debugOnly) {
                     throw apiError;
                 }
-                if (checkoutMode === 'api') {
+                if (shouldFallbackToCheckoutUi(checkoutMode)) {
                     console.log('[Info] 正在回退到 UI 定价页流程...');
                 } else {
                     throw apiError;
@@ -556,11 +592,29 @@ async function run() {
                 throw new Error('API Checkout 失败，调试模式不启用 UI 定价页');
             }
             console.log('🧭 [步骤] 正在打开定价页并选择升级套餐...');
-            await openPricingCheckout(page, {
+            const checkoutUrl = await openPricingCheckout(page, {
                 region: billingCountry,
                 planType
             });
-            checkoutResult = { checkoutUrl: page.url() };
+            checkoutResult = { checkoutUrl };
+        }
+
+        if (preflightOnly) {
+            if (!checkoutResult?.readiness) {
+                checkoutResult.readiness = await require('./checkout-preflight').openVerifiedCheckout(page, checkoutResult, { currency: billingCurrency });
+            }
+            if (!checkoutResult?.readiness?.cardFieldsReady) throw new Error('预检未确认支付表单就绪');
+            const shot = await captureDebugScreenshot(context, page, 'checkout_ready', '支付预检截图');
+            if (shot) console.log(`PREFLIGHT_SCREENSHOT: ${shot}`);
+            console.log(`CHECKOUT_PREFLIGHT_RESULT: ${JSON.stringify({
+                mode: browserSession.mode, source: checkoutResult.source || checkoutMode,
+                httpStatus: checkoutResult.httpStatus || null, planType, country: billingCountry,
+                currency: billingCurrency, cardFieldsReady: true, paymentSubmitted: false
+            })}`);
+            console.log('CHECKOUT_PREFLIGHT_READY');
+            console.log('[预检] 已停止，未预留银行卡、填写卡片或提交付款');
+            preserveExternalPage = true;
+            return;
         }
 
         if (debugOnly) {
@@ -585,6 +639,13 @@ async function run() {
             stripeSessionId
         });
 
+        if (paymentResult.reviewReady && process.env.PAYMENT_REVIEW_ONLY === '1') {
+            preserveExternalPage = true;
+            console.log('PAYMENT_REVIEW_READY');
+            console.log(`[审查] 卡片 ...${paymentResult.cardLast4} 表单已填写；未提交付款，未记录扣款或消费 CDK`);
+            for (const screenshotPath of paymentResult.screenshots || []) console.log(`REVIEW_SCREENSHOT: ${screenshotPath}`);
+            return;
+        }
         if (paymentResult.success) {
             paymentSucceeded = true;
             console.log(`    [+] 最终校验：支付成功! (stripe_card_payment)`);
@@ -603,6 +664,7 @@ async function run() {
 
     } catch (e) {
         console.error("❌ [运行时错误]:", e.message);
+        if (e.code) console.error(`WORKER_ERROR_CODE: ${e.code}`);
         try {
             const errorShot = await captureDebugScreenshot(context, page, 'error');
             if (errorShot) {
@@ -613,12 +675,23 @@ async function run() {
         }
         // 用 exitCode 而非 process.exit()，确保下方 finally 能完整执行（录像需 context 关闭后才落盘）
         process.exitCode = 1;
+        preserveExternalPage = true;
     } finally {
         console.log("👋 [系统] 流程结束，正在关闭浏览器...");
         // 先关闭 context 以 flush 录像并取回路径，再关浏览器
-        await finalizeVideo(context, page, { deleteOnSuccess: paymentSucceeded }).catch(() => { });
-        await closeTaskBrowser(browserSession, browser);
-        await proxyCleanup();
+        if (browserSession?.mode !== 'external' && browserSession?.mode !== 'persistent') {
+            await finalizeVideo(context, page, { deleteOnSuccess: paymentSucceeded }).catch(() => { });
+            // finalizeVideo returns early when recording is disabled or no video exists.
+            await context?.close().catch(() => { });
+        } else if (browserSession?.mode === 'external') {
+            if (preserveExternalPage && page && !page.isClosed()) {
+                console.log('[Browser/external] 已保留当前任务页，供查看或完成人工验证');
+            } else {
+                await page?.close().catch(() => {});
+            }
+        }
+        try { await closeTaskBrowser(browserSession, browser); }
+        finally { await proxyCleanup(); }
     }
 }
 

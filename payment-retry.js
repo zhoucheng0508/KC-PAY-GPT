@@ -65,6 +65,7 @@ async function resolveBilledAmountForRecord(page, paymentResult, preTaxAmount, c
  */
 async function executePaymentWithRetry(page, options) {
     const { planType, cdkCode, email, onProgress, stripeSessionId } = options || {};
+    const reviewOnly = options?.stopBeforeSubmit === true || process.env.PAYMENT_REVIEW_ONLY === '1';
 
     const progress = (msg) => {
         console.log(`[PaymentRetry] ${msg}`);
@@ -85,7 +86,7 @@ async function executePaymentWithRetry(page, options) {
     const lastUsedIdRaw = await store.getAppConfigValue('last_used_address_id', null);
     const lastUsedId = lastUsedIdRaw ? Number(lastUsedIdRaw) : null;
 
-    const address = await pickBillingAddressForCheckout(lastUsedId);
+    const address = await pickBillingAddressForCheckout(lastUsedId, { allowGenerated: !reviewOnly });
     const addressSource = address.generated ? '随机生成' : `地址池 #${address.id}`;
     progress(`已选取美国免税账单地址 (${addressSource}): ${address.line1}, ${address.city}, ${address.state}`);
 
@@ -115,6 +116,7 @@ async function executePaymentWithRetry(page, options) {
     for (let cardAttempt = 1; cardAttempt <= MAX_CARD_ATTEMPTS; cardAttempt += 1) {
         const card = await store.reserveCard(ownerKey);
         if (!card) {
+            if (reviewOnly) return { success: false, error: '卡池无可用卡，无法填写审查表单' };
             progress(cardAttempt === 1 ? '卡池无可用卡，终止支付' : `卡池已无更多可用卡（已拒 ${declinedLast4s.length} 张）`);
             if (cardAttempt === 1) {
                 await store.createBillingRecord({
@@ -149,8 +151,14 @@ async function executePaymentWithRetry(page, options) {
         try {
             const paymentResult = await completeStripeCardPayment(page, cardInfo, address, {
                 cardAttempt,
-                holderName: billingHolderName
+                holderName: billingHolderName,
+                stopBeforeSubmit: reviewOnly
             });
+
+            if (reviewOnly) {
+                if (paymentResult.screenshot) screenshots.push(paymentResult.screenshot);
+                return { ...paymentResult, success: false, cardLast4, screenshots };
+            }
 
             if (paymentResult.holderName) {
                 billingHolderName = paymentResult.holderName;

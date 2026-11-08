@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libdrm2 libgbm1 libgtk-3-0 libnspr4 libnss3 \
     libx11-xcb1 libxcomposite1 libxdamage1 libxrandr2 \
     libxss1 libasound2 libpangocairo-1.0-0 libpango-1.0-0 \
-    libxshmfence1 xdg-utils procps \
+    libxshmfence1 xdg-utils procps xvfb xauth \
     libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 

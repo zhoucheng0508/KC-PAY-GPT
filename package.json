@@ -6,9 +6,14 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "start:local": "node scripts/start-local.cjs",
     "start:headful": "cross-env HEADFUL=1 node server.js",
     "test": "vitest --run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:node": "node scripts/run-node-tests.cjs",
+    "test:all": "npm test && npm run test:node",
+    "review:external": "node scripts/check-external-review.cjs",
+    "check:formal": "node scripts/check-formal-checkout.cjs"
   },
   "engines": {
     "node": ">=20"

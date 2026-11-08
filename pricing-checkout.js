@@ -158,7 +158,7 @@ async function switchToPersonalPlans(page) {
 }
 
 async function getPricingSurface(page) {
-    const dialog = page.locator('[role="dialog"]').first();
+    const dialog = page.locator('[role="dialog"]:visible').first();
     if (await dialog.isVisible({ timeout: 2000 }).catch(() => false)) {
         return dialog;
     }

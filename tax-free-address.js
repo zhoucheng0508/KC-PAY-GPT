@@ -263,11 +263,12 @@ async function batchGenerateUsAddresses(count = 10) {
  * @param {number|null} lastUsedId
  * @returns {Promise<{ id: number, line1: string, city: string, state: string, postal_code: string, country: string, generated?: boolean }>}
  */
-async function pickBillingAddressForCheckout(lastUsedId = null) {
+async function pickBillingAddressForCheckout(lastUsedId = null, { allowGenerated = true } = {}) {
     let picked;
     try {
         picked = await pickTaxFreeAddress('US', lastUsedId);
     } catch (_) {
+        if (!allowGenerated) throw new Error('真实账单地址池不可用，审查模式禁止随机生成地址');
         picked = { id: 0, ...generateRandomUsTaxFreeAddress() };
     }
     return {

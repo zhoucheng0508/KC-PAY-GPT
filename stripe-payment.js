@@ -66,7 +66,7 @@ function generateRandomName() {
  * @param {string} text - 要输入的文本
  */
 async function humanType(context, selector, text) {
-    await context.click(selector);
+    await context.locator(selector).first().focus();
     for (const char of text) {
         await context.type(selector, char, { delay: 0 });
         const delay = getTypingDelay();
@@ -81,7 +81,7 @@ async function humanType(context, selector, text) {
  * @param {string} text - 要输入的文本
  */
 async function humanTypeInFrame(frame, selector, text) {
-    await frame.click(selector);
+    await frame.locator(selector).first().focus();
     for (const char of text) {
         await frame.type(selector, char, { delay: 0 });
         const delay = getTypingDelay();
@@ -102,7 +102,9 @@ async function saveDebugScreenshot(page, prefix) {
         const screenshotDir = path.join(__dirname, 'debug_screenshots', 'stripe');
         fs.mkdirSync(screenshotDir, { recursive: true });
         const filePath = path.join(screenshotDir, `${prefix}_${Date.now()}.png`);
-        const shotOpts = { path: filePath, animations: 'disabled', timeout: 8000 };
+        const masks = process.env.PAYMENT_REVIEW_ONLY === '1'
+            ? page.frames().map(frame => frame.locator('input')) : [];
+        const shotOpts = { path: filePath, animations: 'disabled', timeout: 8000, mask: masks };
         try {
             await page.screenshot({ ...shotOpts, fullPage: false });
         } catch (_) {
@@ -213,7 +215,7 @@ async function prepareCheckoutCardSection(page) {
 async function typeIntoFrameLocator(frameLocator, text) {
     const input = frameLocator.locator('input:not([type="hidden"])').first();
     await input.waitFor({ state: 'visible', timeout: 15000 });
-    await input.click();
+    await input.focus();
     await input.fill('');
     await input.pressSequentially(String(text), { delay: 60 });
 }
@@ -250,6 +252,17 @@ async function fillCardFieldsOpenAiCheckout(page, cardInfo, timeout = 45000) {
     const cardExpiry = normalizeCardExpiry(cardInfo.expiry);
     const cardCvc = String(cardInfo.cvc || '').trim();
 
+    // Semantic fields work with combined payment iframes, translated labels,
+    // and AdsPower mobile targets where CDP pointer clicks can remain pending.
+    const semantic = await discoverCardInputs(page, Math.min(timeout, 8000));
+    if (semantic?.card && semantic.expiry && semantic.cvc) {
+        await fillLocatedInput(semantic.card, cardNumber);
+        await fillLocatedInput(semantic.expiry, cardExpiry);
+        await fillLocatedInput(semantic.cvc, cardCvc);
+        console.log('[Stripe] ✅ 卡号/有效期/CVC 已填写 (语义字段定位)');
+        return { ok: true };
+    }
+
     const frames = await collectStripeInputFrameLocators(page, timeout);
     if (frames.length >= 3) {
         await typeIntoFrameLocator(frames[0], cardNumber);
@@ -268,11 +281,11 @@ async function fillCardFieldsOpenAiCheckout(page, cardInfo, timeout = 45000) {
         console.log(`[Stripe] 单 iframe 内含 ${count} 个 input，按顺序填写`);
         if (count >= 3) {
             const in0 = inputs.nth(0);
-            await in0.click(); await in0.fill(''); await in0.pressSequentially(cardNumber, { delay: 60 });
+            await in0.focus(); await in0.fill(''); await in0.pressSequentially(cardNumber, { delay: 60 });
             const in1 = inputs.nth(1);
-            await in1.click(); await in1.fill(''); await in1.pressSequentially(cardExpiry, { delay: 60 });
+            await in1.focus(); await in1.fill(''); await in1.pressSequentially(cardExpiry, { delay: 60 });
             const in2 = inputs.nth(2);
-            await in2.click(); await in2.fill(''); await in2.pressSequentially(cardCvc, { delay: 60 });
+            await in2.focus(); await in2.fill(''); await in2.pressSequentially(cardCvc, { delay: 60 });
             console.log('[Stripe] ✅ 卡号/有效期/CVC 已填写 (单 iframe 多 input)');
             return { ok: true };
         }
@@ -446,7 +459,7 @@ async function resolveBillingDueResult(page, taxCheck) {
 async function fillLocatedInput(target, text) {
     if (!target || !text) return;
     const { context, selector } = target;
-    await context.click(selector);
+    await context.locator(selector).first().focus();
     await context.fill(selector, '');
     await humanType(context, selector, text);
 }
@@ -460,6 +473,8 @@ async function fillLocatedInput(target, text) {
  * @returns {Promise<{ success: boolean, error?: string, screenshot?: string, declined?: boolean, canRetryCard?: boolean }>}
  */
 async function completeStripeCardPayment(page, cardInfo, address, options = {}) {
+    const reviewOnly = options.stopBeforeSubmit === true || process.env.PAYMENT_REVIEW_ONLY === '1';
+    if (reviewOnly) await require('./payment-review-guard').installPaymentReviewGuard(page);
     const ELEMENT_TIMEOUT = 45000;
     const cardAttempt = Number(options.cardAttempt) || 1;
     const isCardRetry = cardAttempt > 1;
@@ -548,15 +563,18 @@ async function completeStripeCardPayment(page, cardInfo, address, options = {}) 
 
         // 等待账单地址区域出现（chatgpt.com/checkout 在填完卡号后才会展示）
         console.log('[Stripe] Step 5: 等待账单地址表单出现...');
-        await waitForBillingFields(page, 25000);
+        if (!(await require('./checkout-billing-frame').findCheckoutBillingFrame(page))) await waitForBillingFields(page, 25000);
         await page.waitForTimeout(1200);
 
-        holderName = generateRandomName();
+        holderName = String(cardInfo.holder || options.holderName || '').trim();
+        if (!holderName && !reviewOnly) holderName = generateRandomName();
 
         // Step 6: Fill billing address (after card fields) — 仅填必填项
         console.log('[Stripe] Step 6: 填写账单地址与姓名...');
         if (openAiCheckout) {
-            const billingResult = await fillOpenAiCheckoutBilling(page, address, holderName);
+            const billingResult = await require('./checkout-billing-frame').fillCheckoutBillingFrame(page, address, holderName)
+                || await fillOpenAiCheckoutBilling(page, address, holderName);
+            if (billingResult.holderName) holderName = billingResult.holderName;
             if (!billingResult.ok) {
                 const screenshotPath = await saveDebugScreenshot(page, 'billing_address_not_filled');
                 return {
@@ -564,6 +582,9 @@ async function completeStripeCardPayment(page, cardInfo, address, options = {}) 
                     error: billingResult.error || '账单地址填写失败',
                     screenshot: screenshotPath
                 };
+            }
+            if (address.country === 'US' && ['Oregon','Delaware','Montana','New Hampshire','Alaska','OR','DE','MT','NH','AK'].includes(address.state)) {
+                await require('./checkout-billing-frame').verifyCheckoutZeroTax(page);
             }
             if (billingResult.dueAmount) {
                 checkoutDue = {
@@ -600,12 +621,20 @@ async function completeStripeCardPayment(page, cardInfo, address, options = {}) 
                 try {
                     const el = page.locator(sel).first();
                     if (await el.isVisible({ timeout: 2000 })) {
+                        const existingName = (await el.inputValue()).trim();
+                        if (existingName) { holderName = existingName; nameFilled = true; break; }
+                        if (!stripeHolderName) {
+                            if (await el.evaluate(node => node.required || node.getAttribute('aria-required') === 'true')) {
+                                throw Object.assign(new Error('官网要求真实持卡人姓名，当前为空'), { code: 'BILLING_NAME_REQUIRED' });
+                            }
+                            break;
+                        }
                         await el.fill('');
                         await humanType(page, sel, stripeHolderName);
                         nameFilled = true;
                         break;
                     }
-                } catch (_) { /* try next */ }
+                } catch (error) { if (error.code === 'BILLING_NAME_REQUIRED') throw error; }
             }
             if (nameFilled) {
                 console.log(`[Stripe] ✅ 持卡人姓名已填写: ${stripeHolderName}`);
@@ -622,8 +651,7 @@ async function completeStripeCardPayment(page, cardInfo, address, options = {}) 
                 'input[type="checkbox"][id*="terms"]',
                 '.CheckboxInput input[type="checkbox"]',
                 '[data-testid*="agreement"] input[type="checkbox"]',
-                '[data-testid*="terms"] input[type="checkbox"]',
-                'input[type="checkbox"]'
+                '[data-testid*="terms"] input[type="checkbox"]'
             ];
 
             for (const sel of checkboxSelectors) {
@@ -649,6 +677,17 @@ async function completeStripeCardPayment(page, cardInfo, address, options = {}) 
             console.log(`[Stripe] 提交前确认应付: ${checkoutDue.currency || ''} ${checkoutDue.amount}`);
         }
 
+        if (reviewOnly) {
+            const fields = await discoverCardInputs(page, 5000);
+            for (const target of [fields?.card, fields?.expiry, fields?.cvc]) {
+                if (!target || !(await target.context.locator(target.selector).first().inputValue()).trim()) {
+                    return { success: false, error: '审查前校验失败：银行卡字段未完整填写' };
+                }
+            }
+            const screenshot = await saveDebugScreenshot(page, 'payment_review');
+            console.log('[Stripe] 审查模式：已填写表单，停止在付款提交之前');
+            return { success: false, reviewReady: true, holderName, screenshot, dueAmount: checkoutDue?.amount, dueCurrency: checkoutDue?.currency };
+        }
         const payResult = await finalizeCheckoutPayment(page, holderName);
         if (checkoutDue?.amount) {
             payResult.dueAmount = checkoutDue.amount;
@@ -1085,6 +1124,7 @@ async function waitForBillingFields(page, timeout = 20000) {
     ];
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
+        if (await require('./checkout-billing-frame').findCheckoutBillingFrame(page)) return true;
         for (const sel of attachedSelectors) {
             try {
                 if ((await page.locator(sel).count()) > 0) {
@@ -1165,7 +1205,7 @@ async function fillFirstVisibleSelector(page, selectors, value, logLabel, waitMs
                     return true;
                 }
                 await el.scrollIntoViewIfNeeded();
-                await el.click({ timeout: 2000 });
+                await el.focus();
                 await el.fill(String(value));
                 console.log(`  [Stripe] ✅ ${logLabel}: ${value}`);
                 return true;
@@ -1253,7 +1293,7 @@ async function fillInputLocator(locator, value, label = '字段') {
         console.log(`  [Stripe] 填写 ${label}...`);
         await locator.waitFor({ state: 'visible', timeout: 3000 });
         await locator.scrollIntoViewIfNeeded();
-        await locator.click({ timeout: 2000 });
+        await locator.focus();
         await locator.fill(String(value));
         return true;
     } catch (_) {
@@ -1283,6 +1323,11 @@ async function suppressGoogleAddressAutocomplete(page) {
 
 // 关闭 Address line 1 触发的 Google Places 自动补全下拉（我们分字段填地址，不能选建议项）
 async function dismissAddressAutocomplete(page) {
+    if (process.env.BROWSER_RUNTIME_MODE === 'external') {
+        await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
+        await page.keyboard.press('Escape').catch(() => {});
+        return;
+    }
     try {
         const suggestion = page.getByText(/Suggestions powered by Google/i).first();
         const hadDropdown = await suggestion.isVisible({ timeout: 800 }).catch(() => false);
@@ -1338,6 +1383,11 @@ async function dismissAddressAutocomplete(page) {
 }
 
 async function focusOpenAiBillingSection(page) {
+    if (process.env.BROWSER_RUNTIME_MODE === 'external') {
+        await page.evaluate(() => document.activeElement?.blur?.()).catch(() => {});
+        await page.keyboard.press('Escape').catch(() => {});
+        return;
+    }
     await page.locator('body').click({ position: { x: 12, y: 12 }, timeout: 2000 }).catch(() => { });
     await page.keyboard.press('Escape').catch(() => { });
     const heading = page.getByText(/^Billing address$|^账单地址$/i).first();
@@ -1423,7 +1473,7 @@ async function fillBillingTextItem(item, value, logLabel) {
     if (!item?.el || value === undefined || value === null || value === '') return false;
     try {
         await item.el.scrollIntoViewIfNeeded();
-        await item.el.click({ timeout: 3000 });
+        await item.el.focus();
         await item.el.fill(String(value));
         console.log(`  [Stripe] ✅ ${logLabel}: ${value}`);
         return true;
@@ -1756,7 +1806,7 @@ async function fillBillingControl(page, labelPatterns, value, logLabel) {
             }
             return ok;
         }
-        await field.click({ timeout: 2000 });
+        await field.focus();
         await field.fill(String(value));
 
         const val = String(await field.inputValue({ timeout: 1000 }).catch(() => '')).trim();
@@ -2217,12 +2267,12 @@ async function fillBillingLine1Element(el, value, via = '') {
     if (!el || value === undefined || value === null || String(value) === '') return false;
     try {
         await el.scrollIntoViewIfNeeded();
-        await el.click({ timeout: 3000 });
+        await el.focus();
         await el.fill('');
         await el.fill(String(value));
         let val = String(await el.inputValue({ timeout: 1000 }).catch(() => '')).trim();
         if (!val) {
-            await el.click({ timeout: 2000 }).catch(() => { });
+            await el.focus().catch(() => { });
             await el.pressSequentially(String(value), { delay: 35 });
             val = String(await el.inputValue({ timeout: 1000 }).catch(() => '')).trim();
         }
@@ -2527,13 +2577,13 @@ async function clickCheckoutSubmitButton(page) {
 async function fillBillingNameElement(el, fullName, via) {
     try {
         await el.scrollIntoViewIfNeeded();
-        await el.click({ timeout: 2000 });
+        await el.focus();
         await el.fill('');
         await el.fill(String(fullName));
         let val = await el.inputValue({ timeout: 1000 }).catch(() => '');
         if (!val || !val.trim()) {
             // 某些 React 受控输入忽略 fill，改用真实键入
-            await el.click({ timeout: 2000 }).catch(() => { });
+            await el.focus().catch(() => { });
             await el.pressSequentially(String(fullName), { delay: 40 }).catch(() => { });
             val = await el.inputValue({ timeout: 1000 }).catch(() => '');
         }
@@ -2797,6 +2847,7 @@ async function selectCountry(page, selectors, countryCode) {
 
 module.exports = {
     completeStripeCardPayment,
+    fillCardFieldsOpenAiCheckout,
     humanType,
     generateRandomName,
     getTypingDelay,

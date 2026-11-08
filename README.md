@@ -1,5 +1,7 @@
 # KC GPT 自动充值系统
 
+接手当前分支请先读 **[交接说明](HANDOFF.md)**：包含启动方式、模块索引、付款前审查入口、已验证范围与未解决问题。服务器模式见 [SERVER_RUNTIME.md](SERVER_RUNTIME.md)，历史实验见 [SERVER_CHECKOUT.md](SERVER_CHECKOUT.md)。
+
 > **KC ChatGPT PLUS 訂閱開通平台**  
 > 使用者貼上 Session 與兌換 CDK 後，可使用本地 Stripe 自動化流程，或啟用第三方代充 API 建立並輪詢代充訂單。  
 > 配套管理後台：卡池管理、CDK 管理、任務監控、帳單稽核、第三方代充積分與套餐狀態、並發控制。
@@ -138,6 +140,26 @@ API Key 至少需要 `plans:read`、`balance:read`、`pay:write` Scope；如需�
 ### 方式二：多端裸机部署
 
 适合不想用 Docker、或需要在本地调试的场景。
+
+#### Windows 本机 Chrome + 现有 Docker MySQL
+
+本机已安装 Chrome、Node.js 20.12+，并使用本仓库 Compose MySQL（映射到本机 3310）时：
+
+```powershell
+npm ci --omit=dev --ignore-scripts
+npx playwright install ffmpeg
+docker compose up -d mysql
+docker compose stop app
+npm run start:local
+```
+
+打开 `http://localhost:3000/admin-login`。此启动方式读取 `.env` 中的数据库及后台凭据，默认使用本机有头 Chrome、独立任务浏览器，不为浏览器任务配置代理；配置 external 模式时改为连接现有 AdsPower 环境，也不修改数据库中的代理配置。数据库仍保留在 Docker 数据卷中。若仍遇到真人验证，需要人工完成验证。
+
+任务默认开启录屏，即使使用已安装的 Chrome，也需要执行上面的 `npx playwright install ffmpeg` 安装 Playwright 配套 FFmpeg；缺失时会在创建页面时报 `Executable doesn't exist ... ffmpeg-win64.exe`。
+
+可通过 `LOCAL_PORT`、`LOCAL_DB_HOST`、`LOCAL_DB_PORT` 调整本机服务和数据库地址；默认分别为 `3000`、`127.0.0.1`、`3310`。设置 `LOCAL_CHROMIUM_CHANNEL=msedge` 可改用已安装的 Edge。恢复 Docker 应用时，先停止本机 Node 服务释放 3000 端口，再执行 `docker compose start app`。
+
+支付链接调试可接入手动打开的 AdsPower 环境：在 `.env` 设置 `CHECKOUT_DEBUG_CDP_PROFILE_DIR` 为该环境的浏览器数据目录（包含 `DevToolsActivePort`），重启本机服务。每次调试会重新读取端口，使用现有环境的代理、Cookie 和浏览器配置；提交包含有效 sessionToken（也支持 cookies[] / cookieHeader 登录 Cookie）的 Session JSON 后，任务会自动切换账号并验证真实登录状态；仅有 accessToken 时要求浏览器已经登录同一账号。切换失败会恢复原登录。任务不注入项目的 Session 模拟脚本或指纹脚本，不创建新浏览器上下文、不关闭现有环境。此模式不录屏，保留失败截图，同一环境的调试串行执行；环境未打开时直接报错，不回退到 Chrome。单独设置 CHECKOUT_DEBUG_CDP_PROFILE_DIR 时仅对支付链接调试生效；正式任务接入见下方官网客户端建单配置。默认 API 模式下，AdsPower 支付链接调试与自动支付流程共用 Checkout API 建单代码；只有本次调用实际返回新结账链接才会报告成功，失败时保留上游错误，不读取已有页面链接作为成功结果。
 
 #### macOS / Linux 一键安装
 
@@ -446,6 +468,18 @@ A: 管理员 PowerShell 执行：`Set-ExecutionPolicy -Scope CurrentUser RemoteS
 
 
 ---
+
+### 官网客户端建单验证
+
+`CHECKOUT_DEBUG_MODE=official_client` 可让支付链接调试通过当前已登录的官网客户端创建新订单，支持 Plus、Pro 5x 和 Pro 20x 月付。选择 Personal 和目标账单地区后点击对应套餐；Pro 必要时先展开 See all plans，再在新结账会话选择 Standard（`pro_5x` → `chatgptprolite`）或 More usage（`pro_20x` → `chatgptpro`），校验本次建单/档位更新请求与所选档位。要求 HTTP 200 和新的结账会话，不读取已有链接作为成功，不重放或生成安全校验令牌，失败不会回退成成功。调试在建单后停止，不执行付款。
+
+正式任务和调试统一使用官网客户端建单时，配置 `CHECKOUT_MODE=official_client`、`BROWSER_RUNTIME_MODE=external`、`BROWSER_EXTERNAL_CDP_PROFILE_DIR=<AdsPower 环境数据目录>`。本机已启用这组配置。浏览器环境必须预先打开。账号不一致或未登录时，正式任务使用本次 Session 中的登录 Cookie 自动切换，并通过真实 /api/auth/session 验证目标账号；支持长 Cookie 分块，失败恢复旧登录。缺少有效登录 Cookie、环境关闭或套餐不支持时直接报错。同一环境内调试和正式任务互斥执行，环境代理保持不变，不使用浏览器池。Plus、Pro 5x 和 Pro 20x 已在 PH/PHP 环境验证至填表完成、官网显示零税额的付款前页面，未验证实际扣款。
+
+`PAYMENT_REVIEW_ONLY=1` 仅用于填表后的人工审查运行：沿用正式建单与卡池预留/释放，填完卡和账单后停止，不提交付款、不写支付账单/使用次数。提交保护仅放行精确的官网税额报价接口 `/backend-api/payments/checkout/taxes`，仍阻止确认付款接口。指定的美国州账单填写完成后需确认官网页面税额为零，否则停止；地址池名称不证明免税资格，必须使用真实适用的账单信息，税额以官网实际结果为准。审查标志不应作为付款成功处理，也不应全局启用。
+
+`CHECKOUT_DEBUG_VERIFY_PAGE=1` 让支付链接调试进一步验证支付表单：必须出现卡号、有效期、CVC 输入框，并读到任务币种的应付金额。`PAYMENT_PREFLIGHT_ONLY=1` 可在正式 worker 中执行同样验证后停止，输出 `CHECKOUT_PREFLIGHT_READY`；不会进入银行卡预留、填卡或提交付款。预检成功不等于付款成功，也不会标记 CDK 激活成功。该标志仅用于手动运行预检，不应加入正常服务配置。
+
+AdsPower 任务遇到可见人机验证时等待人工完成，不调用自动解题；等待期间任务可继续，超时或失败保留当前任务页。当前进程内每个环境只能执行一个任务。正式任务已关闭付款前审查和预检停止开关，会自动提交付款并按实际结果记录账单和卡片使用；拒付换卡次数遵循 `PAYMENT_MAX_CARD_ATTEMPTS`（本机为 3），整单重试遵循 `MAX_PROCESS_ATTEMPTS` 和错误分类（默认 1 次）。支付链接调试及显式运行的审查脚本仍保留各自的停止行为。提交后结果不明仍需人工核对；本次仅验证到表单就绪，未验证实际扣款、订阅生效或跨任务自动恢复。
 
 ## 免责声明
 

@@ -1141,6 +1141,22 @@ async function clearHumanVerification(page, options = {}) {
     } = options;
 
     const verifyOpts = { requireCheckoutReady };
+    if (options.manualOnly || process.env.HUMAN_VERIFICATION_MODE === 'manual') {
+        const deadline = Date.now() + maxWaitMs;
+        let announced = false;
+        do {
+            const blocked = await isCloudflareWallPage(page) || await isBlockingHumanVerificationVisible(page);
+            if (!blocked && (!requireCheckoutReady || await isCheckoutPaymentReady(page))) {
+                return { cleared: true, via: announced ? 'manual' : 'ready' };
+            }
+            if (!announced) {
+                captchaLog(phase, '任务已暂停等待：请在当前浏览器完成人工验证，完成后将自动继续');
+                announced = true;
+            }
+            await page.waitForTimeout(1500);
+        } while (Date.now() < deadline);
+        return { cleared: false, captchaRequired: true, message: '等待人工验证超时，请在保留的任务页检查' };
+    }
     const effectiveMaxRounds = requireCheckoutReady
         ? Math.max(maxBypassRounds, Number(process.env.CAPTCHA_CHECKOUT_MAX_ROUNDS || 15))
         : maxBypassRounds;

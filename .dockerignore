@@ -10,3 +10,12 @@ data/browser-pool
 .DS_Store
 .vscode
 .idea
+session.json
+session*.json
+session*.txt
+profiles
+scratch
+*.log
+data
+deploy/*.env
+deploy/mihomo

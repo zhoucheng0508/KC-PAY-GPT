@@ -5,6 +5,12 @@ yarn-debug.log*
 yarn-error.log*
 
 # Local env / secrets
+session.json
+session*.json
+session*.txt
+*.log
+profiles/
+deploy/mihomo/
 .env
 .env.*
 !.env.example

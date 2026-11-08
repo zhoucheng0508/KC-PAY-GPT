@@ -1,0 +1,60 @@
+# Standalone deployment; does not merge with the existing local override.
+name: kc-pay-server
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      MYSQL_DATABASE: kc_pay
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./mysql-schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    mem_limit: 1g
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    command: ["xvfb-run", "-a", "--server-args=-screen 0 1365x900x24 -nolisten tcp", "node", "server.js"]
+    ports:
+      - "127.0.0.1:${SERVER_PORT:-3108}:3000"
+    shm_size: 512mb
+    mem_limit: 3g
+    cpus: 2
+    environment:
+      PORT: 3000
+      DB_HOST: mysql
+      DB_NAME: kc_pay
+      DB_USER: root
+      DB_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      BROWSER_RUNTIME_MODE: persistent
+      BROWSER_POOL: "0"
+      PERSISTENT_PROFILE_DIR: /profiles/formal
+      BROWSER_PROXY_MODE: environment
+      PROXY: ${PROXY:?Set a server-accessible proxy URL}
+      CHECKOUT_MODE: official_client
+      CHECKOUT_API_UI_FALLBACK: "0"
+      HEADFUL: "1"
+      RECORD_VIDEO: "0"
+    volumes:
+      - browser_profile:/profiles
+      - app_data:/app/data
+      - screenshots:/app/debug_screenshots
+      - product_files:/app/product_files
+volumes:
+  mysql_data:
+  browser_profile:
+  app_data:
+  screenshots:
+  product_files:

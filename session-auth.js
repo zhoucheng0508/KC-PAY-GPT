@@ -130,7 +130,7 @@ function parseCookieHeader(header) {
 
 function isChatGptCookieDomain(domain) {
     const value = String(domain || '').toLowerCase();
-    return !value || value.includes('chatgpt.com');
+    return !value || value.replace(/^\./, '') === 'chatgpt.com';
 }
 
 function normalizeSameSite(raw) {
@@ -264,7 +264,7 @@ async function injectChatGptCookies(context, cookieSpecs) {
     };
 }
 
-function collectCookieSpecs(sessionData, sessionJson) {
+function collectCookieSpecs(sessionData, sessionJson, options = {}) {
     const specs = [];
     const seen = new Set();
     const seenNames = new Set();
@@ -308,8 +308,8 @@ function collectCookieSpecs(sessionData, sessionJson) {
     const hasExportedSessionToken = [...seenNames].some((name) => isSessionTokenCookieName(name));
 
     const sessionToken = String(
-        process.env.CHATGPT_SESSION_COOKIE
-        || process.env.CHATGPT_SESSION_TOKEN
+        (options.useEnvironment !== false && process.env.CHATGPT_SESSION_COOKIE)
+        || (options.useEnvironment !== false && process.env.CHATGPT_SESSION_TOKEN)
         || sessionData?.sessionToken
         || sessionData?.session_token
         || sessionData?.['__Secure-next-auth.session-token']
@@ -344,47 +344,115 @@ function collectCookieSpecs(sessionData, sessionJson) {
     return specs;
 }
 
-async function verifyRealSessionApi(context) {
-    const probe = await context.newPage();
+async function verifyRealSessionApi(context, options = {}) {
+    const borrowedPage = options.transport === 'fetch' && options.page;
+    const probe = borrowedPage || await context.newPage();
+    let verified = false;
     try {
-        const response = await probe.goto(`${CHATGPT_COOKIE_URL}/api/auth/session`, {
+        if (borrowedPage && (probe.context() !== context || new URL(probe.url()).origin !== CHATGPT_COOKIE_URL)) {
+            return { ok: false, code: 'SESSION_LOGIN_REQUIRED', error: 'Session 校验页面不属于当前 chatgpt.com 浏览器上下文' };
+        }
+        let response = borrowedPage ? null : await probe.goto(options.transport === 'fetch' ? `${CHATGPT_COOKIE_URL}/` : `${CHATGPT_COOKIE_URL}/api/auth/session`, {
             waitUntil: 'domcontentloaded',
             timeout: 60000
         });
+        // In a fresh browser, use the normal same-origin session request after
+        // loading the site. Never retry a denied landing page or solve challenges.
+        let fetchReady = !!borrowedPage || (response?.status() >= 200 && response.status() < 300);
+        if (options.transport === 'fetch' && response?.headers?.()['cf-mitigated'] === 'challenge' && options.onChallenge) {
+            await options.onChallenge(probe);
+            fetchReady = true; // The actual session fetch below must still authenticate.
+        }
+        if (options.transport === 'fetch' && fetchReady) {
+            if (new URL(probe.url()).origin !== CHATGPT_COOKIE_URL) {
+                return { ok: false, code: 'SESSION_LOGIN_REQUIRED', error: 'Session 校验页面已离开 chatgpt.com，停止认证请求' };
+            }
+            const result = await probe.evaluate(async () => {
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), 30000);
+                try {
+                    const result = await fetch('/api/auth/session', {
+                        credentials: 'include', cache: 'no-store', headers: { Accept: 'application/json' },
+                        signal: controller.signal, redirect: 'error'
+                    });
+                    return { status: result.status, headers: Object.fromEntries(result.headers), body: await result.text() };
+                } finally { clearTimeout(timer); }
+            });
+            response = { status: () => result.status, headers: () => result.headers, text: async () => result.body };
+            if (result.headers['cf-mitigated'] === 'challenge' && options.onChallenge) {
+                response = await require('./session-challenge-page').openSessionChallenge(probe, options.onChallenge);
+            }
+        }
         const status = response?.status() || 0;
         const headers = response?.headers?.() || {};
         const headerText = Object.keys(headers).map((k) => `${k}:${headers[k]}`).join('\n').toLowerCase();
-        const bodyText = await probe.evaluate(() => document.body?.innerText || '').catch(() => '');
+        // JSON and challenge responses can have an empty DOM even with a nonempty body.
+        // Read the actual network response before falling back to the rendered page.
+        let bodyText;
+        try {
+            bodyText = await response.text();
+        } catch (_) {
+            bodyText = await probe.evaluate(() => document.body?.innerText || '').catch(() => '');
+        }
         let data = null;
         try {
             data = JSON.parse(bodyText);
         } catch (_) {
             data = null;
         }
-        if (data?.accessToken || data?.user?.email || data?.user?.id) {
+        if (status >= 200 && status < 300 && (data?.accessToken || data?.user?.email || data?.user?.id)) {
+            verified = true;
             return { ok: true, data, status };
         }
-        const isCloudflareChallenge = headerText.includes('cf-mitigated: challenge')
+        const isCloudflareChallenge = /^cf-mitigated:\s*challenge\s*$/m.test(headerText)
             || /just a moment|verify you are human/i.test(bodyText);
         if (isCloudflareChallenge) {
             return {
                 ok: false,
                 status,
                 challenge: true,
-                error: `Cloudflare 人机验证拦截（HTTP ${status}，cf-mitigated: challenge）`
-                    + '。当前出口/代理 IP 被 ChatGPT 风控，请更换干净的住宅代理后重试'
+                code: 'SESSION_HUMAN_VERIFICATION_REQUIRED',
+                error: `Cloudflare 真人验证拦截（HTTP ${status}），尚未验证 Session。`
+                    + '请在运行任务的同一浏览器和代理环境中手动完成验证后重试；已停止后续流程'
             };
         }
-        const snippet = String(bodyText || '').replace(/\s+/g, ' ').slice(0, 120);
+        // A denied/empty response does not establish that the session Cookie expired.
+        // Do not copy arbitrary response bodies into logs: they may contain credentials.
+        const contentType = String(headers['content-type'] || '').split(';')[0];
+        const responseKind = data !== null ? 'JSON' : /html/i.test(contentType) ? 'HTML' : bodyText.trim() ? '非 JSON' : '空响应';
+        const diagnostic = `HTTP ${status}，${responseKind}`;
+        if (status === 403) {
+            return {
+                ok: false,
+                status,
+                error: `Session 校验请求被拒绝（/api/auth/session，${diagnostic}）。`
+                    + '尚无法确认 Cookie 是否有效；请检查浏览器中的访问限制或真人验证，以及代理连接'
+            };
+        }
+        if (status !== 401 && !(status >= 200 && status < 300)) {
+            return {
+                ok: false,
+                status,
+                error: `Session 校验服务异常（/api/auth/session，${diagnostic}），未能确认登录状态，请稍后重试或检查网络`
+            };
+        }
         return {
             ok: false,
             status,
-            error: `session-token 未被 ChatGPT 接受（/api/auth/session 无用户信息，HTTP ${status}${snippet ? `，响应: ${snippet}` : ''}）`
+            error: `session-token 未被 ChatGPT 接受（/api/auth/session 无用户信息，${diagnostic}）。`
+                + '请确认 Cookie 未过期，并尽量粘贴浏览器全部 chatgpt.com Cookies（cookies[] 或 cookieHeader）'
         };
     } catch (err) {
-        return { ok: false, error: `无法验证 session Cookie: ${err.message}` };
+        return { ok: false, code: err.code === 'SESSION_HUMAN_VERIFICATION_REQUIRED' ? err.code : 'SESSION_TRANSPORT_FAILED', error: `无法验证 session Cookie: ${String(err.message).split(/\r?\n/)[0]}` };
     } finally {
-        await probe.close().catch(() => {});
+        if (!verified && typeof options.onFailure === 'function') {
+            try {
+                await options.onFailure(probe);
+            } catch (_) {
+                console.warn('[Session] 校验失败页面截图未能保存');
+            }
+        }
+        if (!borrowedPage) await probe.close().catch(() => {});
     }
 }
 
@@ -479,7 +547,67 @@ function attachLoginRedirectGuard(page) {
  * 在浏览器上下文安装 Session：拦截 auth API + 注入 fetch 补丁
  * 注意：__Secure-next-auth.session-token 是加密 cookie，不能用 accessToken 冒充
  */
-async function installChatGptSession(context, sessionRaw) {
+async function installChatGptSession(context, sessionRaw, options = {}) {
+    if (options.nativeSession) {
+        // Fresh server contexts have no previous login to probe or preserve.
+        let switched = false;
+        let check = options.freshContext ? { ok: false }
+            : await verifyRealSessionApi(context, { onFailure: options.onVerificationFailure, transport: options.sessionTransport, onChallenge: options.onVerificationRequired, page: options.page });
+        if (!check.ok && check.challenge) throw Object.assign(new Error(check.error), { code: check.code, httpStatus: check.status });
+        const expectedEmail = extractEmailFromSession(sessionRaw).toLowerCase();
+        if (!expectedEmail) throw new Error('Session 缺少账号邮箱，无法验证切换目标');
+        const matches = result => result.ok && result.data?.accessToken
+            && String(result.data.user?.email || '').trim().toLowerCase() === expectedEmail;
+        if (!matches(check)) {
+            const resolved = resolveSessionInput(sessionRaw);
+            // Only use credentials provided for this task, never global account cookies.
+            const specs = collectCookieSpecs(resolved.sessionData, resolved.sessionJson, { useEnvironment: false })
+                .filter(cookie => isSessionTokenCookieName(cookie.name));
+            if (!specs.length) {
+                throw new Error('浏览器登录账号与粘贴的 Session 不一致或尚未登录；自动切换需要有效的 sessionToken（或 cookies[] / cookieHeader 中的登录 Cookie），仅 accessToken 不足以切换官网登录账号');
+            }
+            const names = specs.map(cookie => cookie.name);
+            const chunks = specs.filter(cookie => cookie.name !== SESSION_TOKEN_BASE)
+                .sort((a, b) => Number(a.name.split('.').at(-1)) - Number(b.name.split('.').at(-1)));
+            if (new Set(names).size !== names.length || (chunks.length && names.includes(SESSION_TOKEN_BASE))
+                || chunks.some((cookie, i) => cookie.name !== `${SESSION_TOKEN_BASE}.${i}`)) {
+                throw new Error('Session 登录 Cookie 分块重复、缺失或格式不正确，请重新导出');
+            }
+            const tokenValue = (chunks.length ? chunks : specs).map(cookie => sanitizeCookieValue(cookie.value)).join('');
+            if (!tokenValue || tokenValue === resolved.accessToken) throw new Error('sessionToken 不能使用 accessToken 代替，请提供真实登录 Cookie');
+            const incoming = expandSessionTokenCookies(tokenValue).map(toPlaywrightCookie);
+            const authCookie = cookie => isSessionTokenCookieName(cookie.name) || cookie.name === '__Host-next-auth.csrf-token';
+            const previous = (await context.cookies(CHATGPT_COOKIE_URL)).filter(authCookie);
+            const clearAuth = async () => {
+                for (const cookie of (await context.cookies(CHATGPT_COOKIE_URL)).filter(authCookie)) {
+                    await context.clearCookies({ name: cookie.name, domain: cookie.domain, path: cookie.path });
+                }
+            };
+            console.log('[Session] 正在使用本次提交的登录 Cookie 切换浏览器账号...');
+            try {
+                await clearAuth();
+                await context.addCookies(incoming);
+                check = await verifyRealSessionApi(context, { onFailure: options.onVerificationFailure, transport: options.sessionTransport, onChallenge: options.onVerificationRequired, page: options.page });
+                if (!matches(check)) throw new Error(check.error || '切换后的真实登录账号与目标 Session 不一致');
+                switched = true;
+            } catch (error) {
+                try {
+                    await clearAuth();
+                    if (previous.length) await context.addCookies(previous);
+                } catch (_) {
+                    throw new Error('Session 切换失败且旧登录恢复失败，请更新有效登录 Session 后重试');
+                }
+                // Browser errors can include Cookie values; only expose our own verification message.
+                const failure = new Error(`Session 自动切换失败，已恢复原登录：${check?.error || (matches(check) ? '写入登录 Cookie 失败' : '新登录 Cookie 无效或账号不匹配，请更新 Session 后重试')}`);
+                failure.code = check?.code || 'SESSION_VERIFICATION_FAILED';
+                failure.httpStatus = check?.status;
+                throw failure;
+            }
+            console.log('[Session] 已切换并验证本次 Session 的真实登录账号');
+        }
+        console.log('[Session] 已验证浏览器的真实登录状态，使用当前 Session');
+        return { sessionData: check.data, cookieVerified: true, switched };
+    }
     const resolved = resolveSessionInput(sessionRaw);
     if (!resolved?.accessToken) {
         throw new Error('缺少 Session：请粘贴完整 Session JSON（来自 chatgpt.com/api/auth/session）');
@@ -527,17 +655,15 @@ async function installChatGptSession(context, sessionRaw) {
 
     let cookieVerified = false;
     if (injectResult.hasSessionToken) {
-        const apiCheck = await verifyRealSessionApi(context);
+        const apiCheck = await verifyRealSessionApi(context, { onFailure: options.onVerificationFailure });
         if (apiCheck.ok) {
             cookieVerified = true;
             const email = apiCheck.data?.user?.email || '';
             console.log(`[Session] Cookie 校验通过${email ? `: ${email}` : ''}`);
-        } else if (apiCheck.error && !/cloudflare|challenge|captcha/i.test(apiCheck.error)) {
-            throw new Error(
-                `${apiCheck.error}。请确认 Cookie 未过期，并尽量粘贴浏览器全部 chatgpt.com Cookies（cookies[] 或 cookieHeader）`
-            );
         } else {
-            console.warn(`[Session] Cookie 在线校验跳过: ${apiCheck.error || 'unknown'}`);
+            const error = new Error(apiCheck.error || 'Session 在线校验失败');
+            error.code = apiCheck.code || 'SESSION_VERIFICATION_FAILED';
+            throw error;
         }
     }
 
@@ -728,6 +854,7 @@ module.exports = {
     extractSessionPreview,
     extractEmailFromSession,
     buildSessionPayload,
+    verifyRealSessionApi,
     isLoginRedirectUrl,
     isHardLoginRedirectUrl,
     isCheckoutPageUrl,
